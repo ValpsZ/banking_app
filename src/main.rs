@@ -1,6 +1,6 @@
 use std::env;
 
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{rt::System, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use dotenv::dotenv;
 use rusqlite::Connection;
 
@@ -16,13 +16,31 @@ async fn create_user(app_mode: web::Data<String>) -> impl Responder {
 }
 
 async fn get_user(app_mode: web::Data<String>) -> impl Responder {
-    //    let conn: Result<Connection, rusqlite::Error> = Connection::open("database.db");
-    let conn: Result<Connection, rusqlite::Error> = Err(rusqlite::Error::ExecuteReturnedResults);
+    let conn: Result<Connection, rusqlite::Error> = Connection::open("database.db");
+    //let conn: Result<Connection, rusqlite::Error> = Err(rusqlite::Error::ExecuteReturnedResults);
 
     match conn {
         Ok(conn) => HttpResponse::Ok().json("a"),
         Err(_) => utils::server_error("Error while connecting to database", app_mode),
     }
+}
+
+async fn shutdown(
+    req: HttpRequest,
+    app_mode: web::Data<String>,
+    master_api_key: web::Data<String>,
+) -> impl Responder {
+    let api_key = req.headers().get("API-Key");
+
+    if let Some(api_key_value) = api_key {
+        if *api_key_value == ***master_api_key {
+            // Stop the Actix system (which shuts down the server)
+            System::current().stop();
+            return HttpResponse::Ok().body("Server shutting down.");
+        }
+    }
+
+    utils::forbidden("Invalid API key", app_mode)
 }
 
 #[actix_web::main]
@@ -70,6 +88,8 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
 
     let app_mode = env::var("APP_MODE").unwrap_or_else(|_| "prod".to_string());
+    let master_api_key = env::var("API_KEY").unwrap_or_else(|_| "prod".to_string());
+    let system = System::new();
     let port = "127.0.0.1:2000";
 
     match app_mode.to_string().as_str() {
@@ -81,10 +101,15 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(app_mode.clone())) // Pass app_mode as shared data
+            .app_data(web::Data::new(master_api_key.clone())) // Pass app_mode as shared data
             .route("/create_user", web::post().to(create_user))
             .route("/get_user", web::get().to(get_user))
+            .route("/shutdown", web::get().to(shutdown))
     })
     .bind("127.0.0.1:2000")?
     .run()
-    .await
+    .await?;
+    println!("Done");
+
+    Ok(())
 }
