@@ -1,0 +1,9 @@
+[package]
+name = "banking_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4.9.0"
+dotenv = "0.15.0"
+rusqlite = { version = "0.33.0", features = ["bundled"] }
