@@ -1,8 +1,9 @@
-use std::env;
+use std::{env, time::Duration};
 
-use actix_web::{rt::System, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use dotenv::dotenv;
 use rusqlite::Connection;
+use tokio::{signal, sync::broadcast, time::sleep};
 
 mod utils;
 
@@ -29,7 +30,9 @@ async fn shutdown(
     req: HttpRequest,
     app_mode: web::Data<String>,
     master_api_key: web::Data<String>,
+    shutdown_tx: web::Data<broadcast::Sender<()>>,
 ) -> impl Responder {
+    /*
     let api_key = req.headers().get("API-Key");
 
     if let Some(api_key_value) = api_key {
@@ -41,6 +44,15 @@ async fn shutdown(
     }
 
     utils::forbidden("Invalid API key", app_mode)
+    */
+    println!("Stopping server...");
+    let shutdown_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(100)).await;
+        let _ = shutdown_tx.send(());
+    });
+
+    HttpResponse::Ok().body("Stopping server...")
 }
 
 #[actix_web::main]
@@ -89,7 +101,6 @@ async fn main() -> std::io::Result<()> {
 
     let app_mode = env::var("APP_MODE").unwrap_or_else(|_| "prod".to_string());
     let master_api_key = env::var("API_KEY").unwrap_or_else(|_| "prod".to_string());
-    let system = System::new();
     let port = "127.0.0.1:2000";
 
     match app_mode.to_string().as_str() {
@@ -98,8 +109,12 @@ async fn main() -> std::io::Result<()> {
         _ => (),
     }
 
-    HttpServer::new(move || {
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
+    let shutdown_tx_clone = shutdown_tx.clone();
+
+    let server = HttpServer::new(move || {
         App::new()
+            .app_data(web::Data::new(shutdown_tx_clone.clone())) // Pass app_mode as shared data
             .app_data(web::Data::new(app_mode.clone())) // Pass app_mode as shared data
             .app_data(web::Data::new(master_api_key.clone())) // Pass app_mode as shared data
             .route("/create_user", web::post().to(create_user))
@@ -107,9 +122,21 @@ async fn main() -> std::io::Result<()> {
             .route("/shutdown", web::get().to(shutdown))
     })
     .bind("127.0.0.1:2000")?
-    .run()
-    .await?;
-    println!("Done");
+    .run();
+
+    let server_handle = tokio::spawn(server);
+
+    tokio::spawn(async move {
+        signal::ctrl_c()
+            .await
+            .expect("Faild to stop server with CTRL-C");
+        let _ = shutdown_tx.send(());
+    });
+
+    shutdown_rx.recv().await.ok();
+
+    println!("Server stopped.");
+    server_handle.abort();
 
     Ok(())
 }
