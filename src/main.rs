@@ -7,52 +7,54 @@ use tokio::{signal, sync::broadcast, time::sleep};
 
 mod utils;
 
-async fn create_user(app_mode: web::Data<String>) -> impl Responder {
+async fn create_user(config: web::Data<Config<'_>>) -> impl Responder {
     let conn = Connection::open("database.db");
 
     match conn {
         Ok(conn) => HttpResponse::Ok().json("a"),
-        Err(_) => utils::server_error("Error while connecting to database", app_mode),
+        Err(_) => utils::server_error("Error while connecting to database", config.app_mode),
     }
 }
 
-async fn get_user(app_mode: web::Data<String>) -> impl Responder {
+async fn get_user(config: web::Data<Config<'_>>) -> impl Responder {
     let conn: Result<Connection, rusqlite::Error> = Connection::open("database.db");
     //let conn: Result<Connection, rusqlite::Error> = Err(rusqlite::Error::ExecuteReturnedResults);
 
     match conn {
         Ok(conn) => HttpResponse::Ok().json("a"),
-        Err(_) => utils::server_error("Error while connecting to database", app_mode),
+        Err(_) => utils::server_error("Error while connecting to database", config.app_mode),
     }
 }
 
 async fn shutdown(
     req: HttpRequest,
-    app_mode: web::Data<String>,
-    master_api_key: web::Data<String>,
+    config: web::Data<Config<'_>>,
     shutdown_tx: web::Data<broadcast::Sender<()>>,
 ) -> impl Responder {
-    /*
     let api_key = req.headers().get("API-Key");
 
     if let Some(api_key_value) = api_key {
-        if *api_key_value == ***master_api_key {
+        if *api_key_value == *config.master_api_key {
             // Stop the Actix system (which shuts down the server)
-            System::current().stop();
-            return HttpResponse::Ok().body("Server shutting down.");
+            println!("Stopping server...");
+
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                let _ = shutdown_tx.send(());
+            });
+            return HttpResponse::Ok().body("Stopping server...");
         }
     }
 
-    utils::forbidden("Invalid API key", app_mode)
-    */
-    println!("Stopping server...");
-    let shutdown_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        sleep(Duration::from_millis(100)).await;
-        let _ = shutdown_tx.send(());
-    });
+    utils::forbidden("Invalid API key", config.app_mode)
+    //HttpResponse::Forbidden().body("NO")
+}
 
-    HttpResponse::Ok().body("Stopping server...")
+#[derive(Clone)]
+struct Config<'a> {
+    app_mode: &'a str,
+    master_api_key: &'a str,
 }
 
 #[actix_web::main]
@@ -99,8 +101,12 @@ async fn main() -> std::io::Result<()> {
     // Load environment variables from .env in development mode
     dotenv().ok();
 
-    let app_mode = env::var("APP_MODE").unwrap_or_else(|_| "prod".to_string());
-    let master_api_key = env::var("API_KEY").unwrap_or_else(|_| "prod".to_string());
+    let app_mode = env::var("APP_MODE")
+        .unwrap_or_else(|_| "prod".to_string())
+        .as_str();
+    let master_api_key = env::var("API_KEY")
+        .unwrap_or_else(|_| "prod".to_string())
+        .as_str();
     let port = "127.0.0.1:2000";
 
     match app_mode.to_string().as_str() {
@@ -108,15 +114,20 @@ async fn main() -> std::io::Result<()> {
         "prod" => println!("Prod running on port {}", port),
         _ => (),
     }
+    println!("1 {}", app_mode.to_string());
 
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
+    let server_config = Config {
+        app_mode,
+        master_api_key,
+    };
+
     let server = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(shutdown_tx_clone.clone())) // Pass app_mode as shared data
-            .app_data(web::Data::new(app_mode.clone())) // Pass app_mode as shared data
-            .app_data(web::Data::new(master_api_key.clone())) // Pass app_mode as shared data
+            .app_data(web::Data::new(server_config.clone())) // Pass app_mode as shared data
             .route("/create_user", web::post().to(create_user))
             .route("/get_user", web::get().to(get_user))
             .route("/shutdown", web::get().to(shutdown))
