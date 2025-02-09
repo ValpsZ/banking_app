@@ -2,9 +2,8 @@ use std::{env, time::Duration};
 
 use actix_cors::Cors;
 use actix_web::{
-    cookie::{Cookie, SameSite},
     web::{self},
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
+    App, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError,
 };
 use chrono::NaiveDateTime;
 use dotenv::dotenv;
@@ -15,7 +14,6 @@ use rand::{distr::Alphanumeric, rng, Rng};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha512};
 use tokio::{signal, sync::broadcast, time::sleep};
-use uuid::Uuid;
 
 mod error;
 mod utils;
@@ -26,6 +24,11 @@ use serde::{ser::SerializeStruct, Deserialize, Serialize};
 struct User {
     name: String,
     password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Account {
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -96,188 +99,138 @@ fn hash_password(password: &str, salt: String) -> String {
     return hex::encode(hash);
 }
 
-async fn create_user(
-    pool: web::Data<Pool<SqliteConnectionManager>>,
-    config: web::Data<Config>,
-    user: web::Json<User>,
-) -> impl Responder {
-    let conn = pool.get();
-
-    match conn {
-        Ok(conn) => {
-            let salt = generate_salt(16);
-            let hashed_password = hash_password(&user.password, salt.clone());
-            match conn.execute(
-                "INSERT INTO users (name, hashed_password, salt) VALUES (?, ?, ?)",
-                params![user.name, hashed_password, salt],
-            ) {
-                Ok(_) => HttpResponse::Created().body("User created"),
-                Err(err) => {
-                    eprintln!("Database: insert error: {}", err);
-                    utils::respond(
-                        HttpResponse::InternalServerError(),
-                        "Failed to create user",
-                        "Failed to create user",
-                        config.app_mode.clone(),
-                    )
-                }
-            }
-        }
-        Err(err) => {
-            eprintln!("{}", err);
-            utils::respond(
-                HttpResponse::InternalServerError(),
-                &format!("{}", err),
-                "Internal Server Error",
-                config.app_mode.clone(),
-            )
-        }
-    }
-}
-
 async fn secure_hash_eq(hash1: &str, hash2: &str) -> bool {
     tokio::time::sleep(Duration::from_millis(rng().random_range(1..200))).await;
     return *hash1 == *hash2;
 }
 
-async fn login(
+async fn login_endpoint(
     pool: web::Data<Pool<SqliteConnectionManager>>,
-    config: web::Data<Config>,
     user: web::Json<User>,
-    req: HttpRequest,
 ) -> impl Responder {
-    let header_token = req
-        .headers()
-        .get("X-CSRF-Token")
-        .and_then(|val| val.to_str().ok());
-
-    let cookie_token = req.cookie("csrf_token").map(|c| c.value().to_string());
-
-    if header_token.is_none()
-        || cookie_token.is_none()
-        || cookie_token.unwrap() != header_token.unwrap()
-    {
-        return utils::respond(
-            HttpResponse::Forbidden(),
-            "Invalid csrf cookie",
-            "Invalid credentials",
-            config.app_mode.clone(),
-        );
-    }
-
-    let conn = pool.get();
-
-    match conn {
-        Ok(conn) => {
-            let row = match conn.query_row(
-                "SELECT hashed_password, salt FROM users WHERE name = ?",
-                params![user.name],
-                |row| {
-                    let hashed_password: String = row.get(0)?;
-                    let salt: String = row.get(1)?;
-                    Ok((hashed_password, salt))
-                },
-            ) {
-                Ok(row) => row,
-                Err(err) => {
-                    eprintln!("{}", err);
-
-                    return utils::respond(
-                        HttpResponse::InternalServerError(),
-                        &format!("{}", err),
-                        "Internal Server Error",
-                        config.app_mode.clone(),
-                    );
-                }
-            };
-
-            let stored_hashed_password = row.0;
-            let stored_salt = row.1;
-
-            let computed_hash = hash_password(&user.password, stored_salt);
-
-            if secure_hash_eq(&stored_hashed_password, &computed_hash).await {
-                let session_token = Uuid::new_v4().to_string();
-
-                let cookie = Cookie::build("session_token", session_token.clone())
-                    .path("/")
-                    .http_only(true)
-                    .same_site(SameSite::Lax)
-                    .secure(true)
-                    .finish();
-
-                let user_id: i32 = conn
-                    .query_row(
-                        "SELECT user_id FROM users WHERE name = (?)",
-                        params![user.name],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-
-                let _ = conn.execute(
-                    "INSERT INTO cookies (user_id, cookie) VALUES (?, ?)",
-                    params![user_id, session_token.clone()],
-                );
-
-                return HttpResponse::Ok().cookie(cookie).body("Login successful");
-            } else {
-                return utils::respond(
-                    HttpResponse::Unauthorized(),
-                    "Invalid credentials",
-                    "Invalid credentials",
-                    config.app_mode.clone(),
-                );
-            }
-        }
-        Err(err) => {
-            eprintln!("{}", err);
-
-            utils::respond(
-                HttpResponse::InternalServerError(),
-                &format!("{}", err),
-                "Internal Server Error",
-                config.app_mode.clone(),
-            )
-        }
+    match login(user, pool).await {
+        Ok(token) => HttpResponse::Ok().json(serde_json::json!({ "session_token": token})),
+        Err(e) => e.error_response(),
     }
 }
 
-async fn get_csrf_token() -> impl Responder {
-    let token: [u8; 32] = rng().random();
-    let csrf_token = hex::encode(token);
+async fn login(
+    user: web::Json<User>,
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+) -> Result<String, ServerError> {
+    let conn = pool.get()?;
 
-    let csrf_cookie = Cookie::build("csrf_token", csrf_token.clone())
-        .http_only(true)
-        .same_site(SameSite::Strict)
-        .secure(true)
-        .finish();
+    let mut stmt = conn.prepare("SELECT user_id FROM users WHERE name = (?)")?;
 
-    HttpResponse::Ok()
-        .cookie(csrf_cookie)
-        .json(serde_json::json!({ "csrf_token": csrf_token}))
+    let possible_user_ids: Vec<String> = stmt
+        .query_map(params![user.name], |row| row.get::<usize, String>(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let mut user_id_option: Option<String> = None;
+
+    for id in possible_user_ids {
+        let (stored_hash, salt): (String, String) = conn.query_row(
+            "SELECT hashed_password, salt FROM users WHERE user_id = (?)",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let computed_hash = hash_password(&user.password, salt);
+
+        if secure_hash_eq(&computed_hash, &stored_hash).await {
+            user_id_option = Some(id);
+            break;
+        };
+    }
+
+    let user_id = user_id_option.ok_or(ServerError::User("Invalid credentials".to_string()))?;
+
+    let session_token = uuid::Uuid::new_v4().to_string();
+    let cookie_id = uuid::Uuid::new_v4().to_string();
+
+    let _ = conn.execute(
+        r#"INSER INTO cookies (cookie_id, user_id, value, type) VALUES (?, ?, ?, "session")"#,
+        params![cookie_id, user_id, session_token],
+    )?;
+
+    Ok(session_token)
 }
 
-async fn get_user_info(
+async fn get_csrf_token_endpoint(
     req: HttpRequest,
-    config: web::Data<Config>,
     pool: web::Data<Pool<SqliteConnectionManager>>,
 ) -> impl Responder {
-    match fetch_user_info(req, pool) {
-        Ok(user_info) => HttpResponse::Ok().json(user_info),
-        Err(e) => {
-            eprintln!("{}", e);
-
-            utils::respond(
-                HttpResponse::InternalServerError(),
-                &format!("{}", e),
-                "Internal Server Error",
-                config.app_mode.clone(),
-            )
-        }
+    match get_csrf_token(req, pool) {
+        Ok(token) => HttpResponse::Ok().json(serde_json::json!({"csrf_token": token})),
+        Err(e) => e.error_response(),
     }
 }
 
-fn fetch_user_info(
+fn get_csrf_token(
+    req: HttpRequest,
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+) -> Result<String, ServerError> {
+    let conn = pool.get()?;
+
+    let user_id: String = conn.query_row(
+        "SELECT user_id FROM cookies WHERE cookie_id = (?)",
+        params![req
+            .headers()
+            .get("session_token")
+            .ok_or(ServerError::User("No session token".to_string()))?
+            .to_str()?],
+        |row| Ok(row.get::<usize, String>(0)?),
+    )?;
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let cookie_id = uuid::Uuid::new_v4().to_string();
+
+    let _ = conn.execute(
+        "INSERT INTO cookies (cookie_id, user_id, value, type) VALUES (?, ?, ?, ?)",
+        params![cookie_id, user_id, token, "csrf"],
+    )?;
+
+    Ok(token)
+}
+
+async fn create_user_endpoint(
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+    user: web::Json<User>,
+) -> impl Responder {
+    match create_user(pool, user) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!("status: success")),
+        Err(e) => e.error_response(),
+    }
+}
+
+fn create_user(
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+    user: web::Json<User>,
+) -> Result<(), ServerError> {
+    let conn = pool.get()?;
+
+    let salt = generate_salt(32);
+    let hashed_password = hash_password(&user.password, salt.clone());
+    let user_id = uuid::Uuid::new_v4().to_string();
+
+    let _ = conn.execute(
+        "INSERT INTO users user_id, name, hashed_password, salt (?, ?, ?, ?)",
+        params![user_id, user.name, hashed_password, salt],
+    )?;
+
+    Ok(())
+}
+async fn get_user_info_endpoint(
+    req: HttpRequest,
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+) -> impl Responder {
+    match get_user_info(req, pool) {
+        Ok(user_info) => HttpResponse::Ok().json(user_info),
+        Err(e) => e.error_response(),
+    }
+}
+
+fn get_user_info(
     req: HttpRequest,
     pool: web::Data<Pool<SqliteConnectionManager>>,
 ) -> Result<UserInfo, ServerError> {
@@ -285,9 +238,9 @@ fn fetch_user_info(
 
     let cookie = req
         .cookie("session_token")
-        .ok_or(ServerError::Other("No session token".to_owned()))?;
+        .ok_or(ServerError::User("No session token".to_owned()))?;
 
-    let user_id: u32 = conn.query_row(
+    let user_id: String = conn.query_row(
         "SELECT user_id FROM cookies WHERE value = (?)",
         params![cookie.value()],
         |row| row.get(0),
@@ -301,10 +254,10 @@ fn fetch_user_info(
 
     let mut stmt = conn.prepare("SELECT account_id FROM accounts WHERE owner_id = (?)")?;
 
-    let account_ids: Vec<u32> = stmt
-        .query_map(params![user_id], |row| row.get::<_, u32>(0))?
+    let account_ids: Vec<String> = stmt
+        .query_map(params![user_id], |row| row.get::<_, String>(0))?
         .filter_map(|result| result.ok())
-        .collect::<Vec<u32>>();
+        .collect::<Vec<String>>();
 
     let mut accounts: Vec<AccountInfo> = Vec::with_capacity(account_ids.len());
 
@@ -357,6 +310,58 @@ fn fetch_user_info(
     })
 }
 
+async fn create_account_endpoint(
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+    req: HttpRequest,
+    account: web::Json<Account>,
+) -> impl Responder {
+    match create_account(pool, req, account) {
+        Ok(_) => HttpResponse::Ok().body("Created account"),
+        Err(e) => e.error_response(),
+    }
+}
+
+fn create_account(
+    pool: web::Data<Pool<SqliteConnectionManager>>,
+    req: HttpRequest,
+    account: web::Json<Account>,
+) -> Result<(), ServerError> {
+    let session_token = req
+        .headers()
+        .get("X-Session-Token")
+        .ok_or(ServerError::User("No session token".to_string()))?
+        .to_str()?;
+
+    let csrf_token = req
+        .headers()
+        .get("X-CSRF-Token")
+        .ok_or(ServerError::User("No CSRF token".to_string()))?
+        .to_str()?;
+
+    let conn = pool.get()?;
+
+    let _ = conn.query_row(
+        r#"SELECT 1 FROM cookies WHERE type = "csrf" AND value = (?)"#,
+        params![csrf_token],
+        |_| Ok(()),
+    )?;
+
+    let user_id: String = conn.query_row(
+        r#"SELECT user_id FROM cookies WHERE value = (?) AND type = "session""#,
+        params![session_token],
+        |row| row.get(0),
+    )?;
+
+    let account_id = uuid::Uuid::new_v4().to_string();
+
+    let _ = conn.execute(
+        "INSERT INTO accounts (account_id, user_id, name)",
+        params![account_id, user_id, account.name],
+    )?;
+
+    Ok(())
+}
+
 async fn shutdown(
     req: HttpRequest,
     config: web::Data<Config>,
@@ -396,12 +401,12 @@ struct Config {
 async fn main() -> std::io::Result<()> {
     let conn = Connection::open("database.db").expect("Faild to connect to database");
 
-    let _ = conn.execute("DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS accounts; DROP TABLE IF EXISTS transactions", []);
+    let _ = conn.execute("DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS accounts; DROP TABLE IF EXISTS transactions; DROP TABLE IF EXISTS cookies", []);
 
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
+            user_id TEXT PRIMARY KEY UNIQUE,
+            name TEXT NOT NULL,
             hashed_password TEXT NOT NULL,
             salt TEXT NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -411,10 +416,10 @@ async fn main() -> std::io::Result<()> {
 
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS accounts (
-            account_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            account_id TEXT PRIMARY KEY UNIQUE,
+            user_id TEXT NOT NULL,
             name TEXT NOT NULL,
-            balance DECIMAL(20, 4) NOT NULL,
+            balance DECIMAL(20, 4) NOT NULL DEFAULT 0,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
         )",
@@ -423,9 +428,9 @@ async fn main() -> std::io::Result<()> {
 
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS transactions (
-            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_account_id INTEGER NOT NULL,
-            receiver_account_id INTEGER NOT NULL,
+            transaction_id TEXT PRIMARY KEY UNIQUE,
+            sender_account_id TEXT NOT NULL,
+            receiver_account_id TEXT NOT NULL,
             message TEXT,
             amount DECIMAL(20, 4) NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -437,9 +442,10 @@ async fn main() -> std::io::Result<()> {
 
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS cookies (
-            cookie_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            cookie_id TEXT PRIMARY KEY UNIQUE,
+            user_id TEXT NOT NULL,
             value TEXT NOT NULL,
+            type TEXT NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
         )",
@@ -476,11 +482,12 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(shutdown_tx_clone.clone()))
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(server_config.clone()))
-            .route("/create_user", web::post().to(create_user))
-            .route("/login", web::post().to(login))
+            .route("/create_user", web::post().to(create_user_endpoint))
+            .route("/login", web::post().to(login_endpoint))
             .route("/shutdown", web::get().to(shutdown))
-            .route("/get_csrf_token", web::get().to(get_csrf_token))
-            .route("/get_user_info", web::get().to(get_user_info))
+            .route("/get_csrf_token", web::get().to(get_csrf_token_endpoint))
+            .route("/get_user_info", web::get().to(get_user_info_endpoint))
+            .route("/create_account", web::get().to(create_account_endpoint))
     })
     .bind("127.0.0.1:2000")?
     .run();

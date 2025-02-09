@@ -1,4 +1,4 @@
-use actix_web::{error::ResponseError, HttpResponse};
+use actix_web::{error::ResponseError, http::header::ToStrError, HttpResponse};
 use rusqlite::Error as RusqliteError;
 use std::{
     env::{self, VarError},
@@ -15,7 +15,9 @@ pub enum ServerError {
     UuidError(UuidError),
     PoolError(r2d2::Error),
     TimeError(chrono::ParseError),
-    Other(String),
+    Internal(ToStrError),
+    User(String),
+    Forbidden(RusqliteError),
 }
 
 impl fmt::Display for ServerError {
@@ -26,7 +28,9 @@ impl fmt::Display for ServerError {
             ServerError::UuidError(e) => write!(f, "UUID error: {}", e),
             ServerError::PoolError(e) => write!(f, "Pool error: {}", e),
             ServerError::TimeError(e) => write!(f, "Time error: {}", e),
-            ServerError::Other(e) => write!(f, "Other error: {}", e),
+            ServerError::Internal(e) => write!(f, "Internal error: {}", e),
+            ServerError::User(e) => write!(f, "User error: {}", e),
+            ServerError::Forbidden(e) => write!(f, "Forbidden error: {}", e),
         }
     }
 }
@@ -41,13 +45,22 @@ impl From<VarError> for ServerError {
 
 impl From<RusqliteError> for ServerError {
     fn from(err: RusqliteError) -> Self {
-        ServerError::DatabaseError(err)
+        match err {
+            RusqliteError::QueryReturnedNoRows => ServerError::Forbidden(err),
+            _ => ServerError::DatabaseError(err),
+        }
     }
 }
 
 impl From<UuidError> for ServerError {
     fn from(err: UuidError) -> Self {
         ServerError::UuidError(err)
+    }
+}
+
+impl From<ToStrError> for ServerError {
+    fn from(err: ToStrError) -> Self {
+        ServerError::Internal(err)
     }
 }
 
@@ -66,11 +79,26 @@ impl From<chrono::ParseError> for ServerError {
 impl ResponseError for ServerError {
     fn error_response(&self) -> actix_web::HttpResponse {
         let app_mode = env::var("APP_MODE").unwrap_or("prod".to_owned());
-        utils::respond(
-            HttpResponse::InternalServerError(),
-            &format!("{}", self),
-            "Internal Server Error",
-            app_mode,
-        )
+        eprintln!("{}", self);
+
+        match self {
+            ServerError::EnvError(_)
+            | ServerError::DatabaseError(_)
+            | ServerError::UuidError(_)
+            | ServerError::PoolError(_)
+            | ServerError::TimeError(_)
+            | ServerError::Internal(_) => utils::respond(
+                HttpResponse::InternalServerError(),
+                &format!("{}", self),
+                "Internal Server Error",
+                app_mode,
+            ),
+            ServerError::Forbidden(_) | ServerError::User(_) => utils::respond(
+                HttpResponse::Forbidden(),
+                &format!("{}", self),
+                "Forbidden",
+                app_mode,
+            ),
+        }
     }
 }
